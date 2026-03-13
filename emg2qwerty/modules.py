@@ -7,8 +7,44 @@
 from collections.abc import Sequence
 
 import torch
+import math
 from torch import nn
 
+
+class AutoEncoder(nn.Module):
+    """Attempt using 'Time Series Data Augmentation for Deep Learning: A Survey'
+    Embeddings to generate synthetic data. Says do small transformations on
+    embeddings to create better synthetic data than usual.
+    """
+    def __init__(
+      self,
+      input_size : int,
+      hidden_in : int,
+      hidden_out : int,
+      output_size : int
+    ):
+      super().__init__()
+
+      self.enc = nn.Sequential(
+          nn.Conv1d(input_size, hidden_in, 5, 2, 2),
+          nn.ReLU(),
+          nn.Conv1d(hidden_in, hidden_out, 5, 2, 2),
+          nn.ReLU(),
+          nn.Conv1d(hidden_out, output_size, 5, 2, 2),
+          nn.ReLU()
+      )
+
+      self.dec = nn.Sequential(
+          nn.ConvTranspose1d(output_size, hidden_out, 5, 2, 2, output_padding=1),
+          nn.ReLU(),
+          nn.ConvTranspose1d(hidden_out, hidden_in, 5, 2, 2, output_padding=1),
+          nn.ReLU(),
+          nn.ConvTranspose1d(hidden_in, input_size, 5, 2, 2, output_padding=1)
+      )
+    
+    def forward(self, inputs : torch.Tensor):
+      outputs = self.enc(inputs)
+      return self.dec(outputs)
 
 class SpectrogramNorm(nn.Module):
     """A `torch.nn.Module` that applies 2D batch normalization over spectrogram
@@ -183,7 +219,7 @@ class TDSConv2dBlock(nn.Module):
         kernel_width (int): The kernel size of the temporal convolution.
     """
 
-    def __init__(self, channels: int, width: int, kernel_width: int) -> None:
+    def __init__(self, channels: int, width: int, kernel_width: int, dropout: float = 0.3) -> None:
         super().__init__()
         self.channels = channels
         self.width = width
@@ -194,6 +230,8 @@ class TDSConv2dBlock(nn.Module):
             kernel_size=(1, kernel_width),
         )
         self.relu = nn.ReLU()
+        # Adding dropout as specified in the same paper after ReLU
+        self.dropout = nn.Dropout(p=dropout)
         self.layer_norm = nn.LayerNorm(channels * width)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -204,6 +242,9 @@ class TDSConv2dBlock(nn.Module):
         x = self.conv2d(x)
         x = self.relu(x)
         x = x.reshape(N, C, -1).movedim(-1, 0)  # NcwT -> NCT -> TNC
+
+        # dropout added
+        x = self.dropout(x)
 
         # Skip connection after downsampling
         T_out = x.shape[0]
@@ -259,6 +300,7 @@ class TDSConvEncoder(nn.Module):
         num_features: int,
         block_channels: Sequence[int] = (24, 24, 24, 24),
         kernel_width: int = 32,
+        dropout: float = 0.3
     ) -> None:
         super().__init__()
 
@@ -270,7 +312,7 @@ class TDSConvEncoder(nn.Module):
             ), "block_channels must evenly divide num_features"
             tds_conv_blocks.extend(
                 [
-                    TDSConv2dBlock(channels, num_features // channels, kernel_width),
+                    TDSConv2dBlock(channels, num_features // channels, kernel_width, dropout),
                     TDSFullyConnectedBlock(num_features),
                 ]
             )
@@ -278,3 +320,116 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+class RnnLayer(nn.Module):
+  def __init__(
+    self,
+    num_features: int,
+    hidden : int,
+    layers = 1,
+    rnn_type = "RNN",
+    bidirectional = False,
+    dropout: float = 0.3
+  ):
+    super().__init__()
+
+    # rnn doesnt work with dropout if layers ==1 
+    if layers == 1:
+      if rnn_type == "LSTM":
+        self.rnn = nn.LSTM(num_features, hidden, layers, bidirectional=bidirectional)
+      elif rnn_type == "GRU":
+        self.rnn = nn.GRU(num_features, hidden, layers, bidirectional=bidirectional)
+      else:
+        self.rnn = nn.RNN(num_features, hidden, layers, bidirectional=bidirectional)
+    
+    else:
+      if rnn_type == "LSTM":
+        self.rnn = nn.LSTM(num_features, hidden, layers, bidirectional=bidirectional, dropout=dropout)
+      elif rnn_type == "GRU":
+        self.rnn = nn.GRU(num_features, hidden, layers, bidirectional=bidirectional, dropout=dropout)
+      else:
+        self.rnn = nn.RNN(num_features, hidden, layers, bidirectional=bidirectional, dropout=dropout)
+  
+  def forward(self, inputs: torch.Tensor):
+    outputs, _ = self.rnn(inputs)
+    return outputs
+
+# Note: Test set has Dim 140,000 so seq_len needs to be
+# very high in order to use this
+class PositionalEncoding(nn.Module):
+  def __init__(
+    self,
+    d_model: int,
+    seq_len: int = 100
+  ):
+    super().__init__()
+
+    self.d_model = d_model
+    self.seq_len = seq_len
+
+    pos_enc = torch.zeros(seq_len, 1, d_model)
+    pos = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+
+    pos_enc[:, 0, 0::2] = torch.sin(pos * div_term)
+    pos_enc[:, 0, 1::2] = torch.cos(pos * div_term)
+
+    self.register_buffer('pos_encoding', pos_enc)
+
+  def forward(self, inputs : torch.Tensor):
+    outputs = inputs + self.pos_encoding[:inputs.size(0)]
+    return outputs
+
+# Possible Solution to seq_len issue
+class ConvPositionalEncoder(nn.Module):
+  def __init__(
+    self,
+    d_model: int,
+    kernel_size: int = 31
+  ):
+    super().__init__()
+
+    self.pos = nn.Conv1d(
+      d_model,
+      d_model,
+      kernel_size=kernel_size,
+      stride=1,
+      padding=kernel_size // 2,
+      groups=d_model
+    )
+  
+  def forward(self, inputs : torch.Tensor):
+    output = self.pos(inputs.permute(1, 2, 0))
+    return inputs + output.permute(2, 0, 1)
+
+class TransformerLayer(nn.Module):
+  def __init__(
+    self,
+    num_features: int,
+    d_model: int = 256,
+    kernel_size: int = 31,
+    n_heads: int = 4,
+    num_layers: int = 1
+  ):
+    super().__init__()
+
+    self.linear = nn.Linear(num_features, d_model)
+    self.pos_enc = ConvPositionalEncoder(d_model, kernel_size=kernel_size)
+
+    transformers = nn.TransformerEncoderLayer(
+      d_model=d_model,
+      nhead=n_heads,
+      dim_feedforward=(d_model * 4),
+      norm_first=True
+    )
+
+    self.tf = nn.TransformerEncoder(
+      transformers,
+      num_layers,
+      norm=nn.LayerNorm(d_model)
+    )
+
+  def forward(self, inputs : torch.Tensor):
+    outputs = self.linear(inputs)
+    outputs = self.pos_enc(outputs)
+    return self.tf(outputs)

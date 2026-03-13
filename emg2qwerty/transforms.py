@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 import numpy as np
 import torch
 import torchaudio
+import random
 
 
 TTransformIn = TypeVar("TTransformIn")
@@ -243,3 +244,127 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+@dataclass
+class IntensityAugment:
+    intensity_mod : float = 0.2 # maximum modification value fr * (1.0 plus or minus this)
+    pr : float = 0.3 # probability a frequency is modified
+
+    def __call__(self, specgram : torch.Tensor):
+        if random.random() < self.pr:
+            scale = random.uniform(1.0 - self.intensity_mod, 1.0 + self.intensity_mod)
+            specgram = specgram * scale
+        return specgram
+
+@dataclass
+class ReversedElectrodesAugment:
+    """A data augmentation techinque suggested in https://ieeexplore.ieee.org/document/8664790
+    where all electrodes are placed backwards (Condition 1-2).
+    """
+    pr : float = 0.3
+
+    def __call__(self, specgram : torch.Tensor):
+        if random.random() < self.pr:
+            # I think since channels is 2nd to last I flip it along channels
+            return torch.flip(specgram, dims=[-2])
+        return specgram
+
+@dataclass
+class RandomSwapAugment:
+    """A data augmentation technique suggested in the same paper where
+    two random channels are swapped (Condition 2)
+    """
+    pr : float = 0.3
+
+    def __call__(self, specgram : torch.Tensor):
+        if random.random() < self.pr:
+            num_channels = specgram.shape[-2]
+            channel1 = random.randint(0, num_channels - 1)
+            channel2 = random.randint(0, num_channels - 1)
+
+            c1_vals = specgram[..., channel1, :].clone()
+            # channel2 stored in channel1
+            specgram[..., channel1, :] = specgram[..., channel2, :]
+            # channel1 copy stored in channel2
+            specgram[..., channel2, :] = c1_vals
+        return specgram
+
+@dataclass
+class UserErrorAugment:
+  """This class combines the previous ones to choose a single error augmentation.
+  It seems rather unlikely that the RandomSwap and the 
+  Reversed electrodes would occur in the same data collection session, so
+  this will only pick 1.
+  """
+  pr : float = 0.3
+
+  def __call__(self, specgram : torch.Tensor):
+      if random.random() < self.pr:
+          if random.random() < 0.5:
+              # do swap
+              return torch.flip(specgram, dims=[-2])
+          else:
+              num_channels = specgram.shape[-2]
+              channel1 = random.randint(0, num_channels - 1)
+              channel2 = random.randint(0, num_channels - 1)
+
+              c1_vals = specgram[..., channel1, :].clone()
+              # channel2 stored in channel1
+              specgram[..., channel1, :] = specgram[..., channel2, :]
+              # channel1 copy stored in channel2
+              specgram[..., channel2, :] = c1_vals
+
+              return specgram
+      return specgram
+
+@dataclass
+class BadSensorAugment:
+    pr : float = 0.05
+    
+    def __call__(self, specgram : torch.Tensor):
+        processed = specgram.clone()
+
+        # iterate over each channel
+        for channel in range(specgram.shape[-2]):
+            # zero ouit a channel with probability pr
+            if random.random() < self.pr:
+                processed[..., channel, :] = 0.0
+        
+
+        return processed
+
+@dataclass
+class RemoveChannelAugment:
+    """Removes a given channel. Meant to be used during validation runs in
+    order to see if accuracy is preserved when certain channels are removed.
+    """
+    channels: Sequence[int] = ()
+
+    def __call__(self, specgram : torch.Tensor):
+        if not self.channels:
+            return specgram
+
+        processed = specgram.clone()
+        for channel in self.channels:
+            processed[..., channel, :] = 0.0
+        return processed
+
+@dataclass
+class GaussianNoise:
+    noise: float = 1.0
+    pr: float = 0.4
+
+    def __call__(self, specgram : torch.Tensor):
+        if random.random() < self.pr:
+            noise = torch.randn_like(specgram) * self.noise
+            return specgram + noise
+        return specgram
+
+@dataclass
+class DecreaseSampleRate:
+    """Takes every nth time step using `self.rate`.
+    """
+    rate : int = 1
+
+    def __call__(self, specgram : torch.Tensor):
+        return specgram[::self.rate, ...]
